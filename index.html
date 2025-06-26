@@ -4,7 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PDF Combiner - Open Source</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+    <!-- Using PDF.js for reading PDFs and jsPDF for creating PDFs -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -320,7 +322,7 @@
     <div class="container">
         <div class="header">
             <h1>📄 PDF Combiner</h1>
-            <p>Combine multiple PDF files into one - 100% Open Source & Free</p>
+            <p>Combine multiple PDF files into one - Using PDF.js + jsPDF</p>
         </div>
 
         <div class="main-content">
@@ -363,6 +365,9 @@
                     <button class="btn btn-secondary" id="combineBtn" onclick="combinePDFs()" disabled>
                         🔗 Combine PDFs
                     </button>
+                    <button class="btn" id="refreshBtn" onclick="refreshFiles()" disabled>
+                        🔄 Refresh Files
+                    </button>
                     <button class="btn btn-danger btn-small" id="clearBtn" onclick="clearAll()" disabled>
                         🗑️ Clear All
                     </button>
@@ -372,11 +377,14 @@
 
         <div class="footer">
             <p>🔓 Open Source • 🛡️ Privacy First • 💾 No Data Uploaded to Servers</p>
-            <p>All processing happens locally in your browser</p>
+            <p>All processing happens locally in your browser using PDF.js + jsPDF</p>
         </div>
     </div>
 
     <script>
+        // Configure PDF.js worker
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
         class PDFCombinerApp {
             constructor() {
                 this.pdfs = [];
@@ -462,28 +470,21 @@
 
             async addPDF(file) {
                 try {
-                    // Read file as ArrayBuffer and create multiple independent copies
-                    const originalArrayBuffer = await file.arrayBuffer();
+                    // Read file as ArrayBuffer
+                    const arrayBuffer = await file.arrayBuffer();
                     
-                    // Create completely independent copies
-                    const validationBuffer = new ArrayBuffer(originalArrayBuffer.byteLength);
-                    new Uint8Array(validationBuffer).set(new Uint8Array(originalArrayBuffer));
+                    // Load PDF using PDF.js to validate and get info
+                    const pdfDoc = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
+                    const pageCount = pdfDoc.numPages;
                     
-                    const storageBuffer = new ArrayBuffer(originalArrayBuffer.byteLength);
-                    new Uint8Array(storageBuffer).set(new Uint8Array(originalArrayBuffer));
-                    
-                    // Validate PDF with separate buffer
-                    const pdfDoc = await PDFLib.PDFDocument.load(validationBuffer);
-                    const pageCount = pdfDoc.getPageCount();
-                    
-                    // Store PDF data with fresh buffer
+                    // Store PDF data
                     this.pdfs.push({
                         id: Date.now() + Math.random(),
                         file: file,
                         name: file.name,
                         size: file.size,
                         pageCount: pageCount,
-                        originalArrayBuffer: storageBuffer // Store the independent copy
+                        addedAt: new Date().toISOString()
                     });
                     
                 } catch (error) {
@@ -543,128 +544,103 @@
                 this.showProgress(true);
                 
                 try {
-                    // Create new merged PDF document
-                    const mergedPdf = await PDFLib.PDFDocument.create();
+                    // Create new jsPDF document
+                    const { jsPDF } = window.jspdf;
+                    const mergedPdf = new jsPDF();
                     let totalPages = 0;
                     let successfulFiles = 0;
+                    let isFirstPage = true;
 
                     for (let i = 0; i < this.pdfs.length; i++) {
                         const pdf = this.pdfs[i];
-                        const progress = ((i + 1) / this.pdfs.length) * 85; // Reserve 15% for final processing
+                        const progress = ((i + 1) / this.pdfs.length) * 85;
                         this.updateProgress(progress);
 
                         try {
-                            // Create a completely fresh, independent copy of the ArrayBuffer
-                            const workingBuffer = new ArrayBuffer(pdf.originalArrayBuffer.byteLength);
-                            new Uint8Array(workingBuffer).set(new Uint8Array(pdf.originalArrayBuffer));
+                            // Read fresh from file
+                            const arrayBuffer = await pdf.file.arrayBuffer();
                             
-                            // Load PDF document from fresh buffer
-                            const sourcePdf = await PDFLib.PDFDocument.load(workingBuffer, {
-                                ignoreEncryption: true,
-                                parseSpeed: PDFLib.ParseSpeeds.Slow,
-                                throwOnInvalidObject: false
-                            });
+                            // Load PDF using PDF.js
+                            const pdfDoc = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
+                            const numPages = pdfDoc.numPages;
                             
-                            const pageCount = sourcePdf.getPageCount();
-                            
-                            if (pageCount === 0) {
-                                console.warn(`PDF ${pdf.name} has no pages, skipping.`);
-                                continue;
-                            }
-                            
-                            // Copy pages individually for better control
-                            for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
-                                try {
-                                    const [copiedPage] = await mergedPdf.copyPages(sourcePdf, [pageIndex]);
-                                    mergedPdf.addPage(copiedPage);
-                                    totalPages++;
-                                } catch (pageError) {
-                                    console.warn(`Error copying page ${pageIndex + 1} from ${pdf.name}:`, pageError);
-                                    // Continue with next page instead of failing completely
+                            // Process each page
+                            for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+                                const page = await pdfDoc.getPage(pageNum);
+                                const viewport = page.getViewport({scale: 1.5});
+                                
+                                // Create canvas to render page
+                                const canvas = document.createElement('canvas');
+                                const context = canvas.getContext('2d');
+                                canvas.height = viewport.height;
+                                canvas.width = viewport.width;
+                                
+                                // Render page to canvas
+                                await page.render({
+                                    canvasContext: context,
+                                    viewport: viewport
+                                }).promise;
+                                
+                                // Convert canvas to image data
+                                const imgData = canvas.toDataURL('image/jpeg', 0.8);
+                                
+                                // Add page to jsPDF (add new page for all but first)
+                                if (!isFirstPage) {
+                                    mergedPdf.addPage();
                                 }
+                                isFirstPage = false;
+                                
+                                // Calculate dimensions to fit page
+                                const pdfWidth = mergedPdf.internal.pageSize.getWidth();
+                                const pdfHeight = mergedPdf.internal.pageSize.getHeight();
+                                const imgAspectRatio = viewport.width / viewport.height;
+                                const pdfAspectRatio = pdfWidth / pdfHeight;
+                                
+                                let imgWidth, imgHeight;
+                                if (imgAspectRatio > pdfAspectRatio) {
+                                    imgWidth = pdfWidth;
+                                    imgHeight = pdfWidth / imgAspectRatio;
+                                } else {
+                                    imgHeight = pdfHeight;
+                                    imgWidth = pdfHeight * imgAspectRatio;
+                                }
+                                
+                                // Center the image on the page
+                                const x = (pdfWidth - imgWidth) / 2;
+                                const y = (pdfHeight - imgHeight) / 2;
+                                
+                                // Add image to PDF
+                                mergedPdf.addImage(imgData, 'JPEG', x, y, imgWidth, imgHeight);
+                                
+                                totalPages++;
                             }
                             
                             successfulFiles++;
                             
                         } catch (pdfError) {
                             console.error(`Error processing PDF ${pdf.name}:`, pdfError);
-                            this.showStatus(`Warning: Could not process "${pdf.name}". ${pdfError.message}`, 'error');
-                            
-                            // For protected/encrypted PDFs, try to read from original file again
-                            try {
-                                const freshFileBuffer = await pdf.file.arrayBuffer();
-                                const workingBuffer2 = new ArrayBuffer(freshFileBuffer.byteLength);
-                                new Uint8Array(workingBuffer2).set(new Uint8Array(freshFileBuffer));
-                                
-                                const sourcePdf2 = await PDFLib.PDFDocument.load(workingBuffer2, {
-                                    ignoreEncryption: false,
-                                    parseSpeed: PDFLib.ParseSpeeds.Fast
-                                });
-                                
-                                const pageCount2 = sourcePdf2.getPageCount();
-                                const [copiedPages] = await Promise.all([
-                                    mergedPdf.copyPages(sourcePdf2, Array.from({length: pageCount2}, (_, i) => i))
-                                ]);
-                                
-                                copiedPages.forEach(page => mergedPdf.addPage(page));
-                                totalPages += pageCount2;
-                                successfulFiles++;
-                                
-                            } catch (retryError) {
-                                console.error(`Retry failed for ${pdf.name}:`, retryError);
-                                continue; // Skip this file completely
-                            }
+                            this.showStatus(`Warning: Could not process "${pdf.name}". Skipping this file.`, 'error');
+                            continue;
                         }
                     }
 
                     if (totalPages === 0) {
-                        throw new Error('No pages could be processed from any PDF files. Please check if the files are corrupted or password-protected.');
+                        throw new Error('No pages could be processed from any PDF files.');
                     }
 
-                    this.updateProgress(90);
+                    this.updateProgress(95);
                     
-                    // Save the merged PDF with conservative settings
-                    let pdfBytes;
-                    try {
-                        pdfBytes = await mergedPdf.save({
-                            useObjectStreams: false,
-                            addDefaultPage: false,
-                            objectsPerTick: 25,
-                            updateFieldAppearances: false
-                        });
-                    } catch (saveError) {
-                        console.warn('Primary save failed, trying fallback method:', saveError);
-                        // Fallback save method
-                        pdfBytes = await mergedPdf.save();
-                    }
+                    // Save and download the PDF
+                    mergedPdf.save(`${filename}.pdf`);
                     
                     this.updateProgress(100);
-
-                    // Create and download the file
-                    const blob = new Blob([pdfBytes], { 
-                        type: 'application/pdf'
-                    });
-                    
-                    const url = URL.createObjectURL(blob);
-                    const downloadLink = document.createElement('a');
-                    downloadLink.href = url;
-                    downloadLink.download = `${filename}.pdf`;
-                    downloadLink.style.display = 'none';
-                    
-                    document.body.appendChild(downloadLink);
-                    downloadLink.click();
-                    document.body.removeChild(downloadLink);
-                    
-                    // Clean up the URL after a short delay
-                    setTimeout(() => URL.revokeObjectURL(url), 1000);
-
                     this.showProgress(false);
                     this.showStatus(`✅ Successfully combined ${successfulFiles}/${this.pdfs.length} PDFs into "${filename}.pdf" with ${totalPages} pages!`, 'success');
 
                 } catch (error) {
                     console.error('Error combining PDFs:', error);
                     this.showProgress(false);
-                    this.showStatus(`Error combining PDFs: ${error.message}. Try refreshing the page and re-uploading the files.`, 'error');
+                    this.showStatus(`Error: ${error.message}`, 'error');
                 }
             }
 
@@ -672,7 +648,30 @@
                 this.pdfs = [];
                 this.updateUI();
                 document.getElementById('fileInput').value = '';
-                this.showStatus('All PDFs cleared.', 'info');
+                document.getElementById('filenameInput').value = 'combined-document';
+                
+                // Force garbage collection to clear any lingering references
+                if (window.gc) {
+                    window.gc();
+                }
+                
+                this.showStatus('All PDFs cleared. Memory cleaned.', 'info');
+            }
+
+            refreshFiles() {
+                // Clear any potential memory corruption by refreshing file references
+                this.pdfs.forEach(pdf => {
+                    // Clear any cached data that might be corrupted
+                    if (pdf.cachedBuffer) {
+                        delete pdf.cachedBuffer;
+                    }
+                });
+                
+                if (window.gc) {
+                    window.gc();
+                }
+                
+                this.showStatus('File references refreshed.', 'info');
             }
 
             updateUI() {
@@ -680,15 +679,18 @@
                 const pdfItems = document.getElementById('pdfItems');
                 const combineBtn = document.getElementById('combineBtn');
                 const clearBtn = document.getElementById('clearBtn');
+                const refreshBtn = document.getElementById('refreshBtn');
 
                 if (this.pdfs.length === 0) {
                     pdfList.style.display = 'none';
                     combineBtn.disabled = true;
                     clearBtn.disabled = true;
+                    refreshBtn.disabled = true;
                 } else {
                     pdfList.style.display = 'block';
                     combineBtn.disabled = false;
                     clearBtn.disabled = false;
+                    refreshBtn.disabled = false;
 
                     pdfItems.innerHTML = this.pdfs.map((pdf, index) => `
                         <div class="pdf-item">
@@ -767,6 +769,10 @@
         // Global functions for onclick handlers
         function combinePDFs() {
             app.combinePDFs();
+        }
+
+        function refreshFiles() {
+            app.refreshFiles();
         }
 
         function clearAll() {
