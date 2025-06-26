@@ -461,24 +461,33 @@
             }
 
             async addPDF(file) {
-                const arrayBuffer = await file.arrayBuffer();
-                
-                // Validate PDF
                 try {
-                    const pdfDoc = await PDFLib.PDFDocument.load(arrayBuffer);
+                    // Read file as ArrayBuffer and create multiple independent copies
+                    const originalArrayBuffer = await file.arrayBuffer();
+                    
+                    // Create completely independent copies
+                    const validationBuffer = new ArrayBuffer(originalArrayBuffer.byteLength);
+                    new Uint8Array(validationBuffer).set(new Uint8Array(originalArrayBuffer));
+                    
+                    const storageBuffer = new ArrayBuffer(originalArrayBuffer.byteLength);
+                    new Uint8Array(storageBuffer).set(new Uint8Array(originalArrayBuffer));
+                    
+                    // Validate PDF with separate buffer
+                    const pdfDoc = await PDFLib.PDFDocument.load(validationBuffer);
                     const pageCount = pdfDoc.getPageCount();
                     
+                    // Store PDF data with fresh buffer
                     this.pdfs.push({
                         id: Date.now() + Math.random(),
                         file: file,
                         name: file.name,
                         size: file.size,
                         pageCount: pageCount,
-                        // Store a copy of the arrayBuffer to prevent corruption
-                        arrayBuffer: arrayBuffer.slice(0)
+                        originalArrayBuffer: storageBuffer // Store the independent copy
                     });
+                    
                 } catch (error) {
-                    throw new Error(`Invalid PDF file: ${file.name}`);
+                    throw new Error(`Invalid or corrupted PDF file: ${file.name}`);
                 }
             }
 
@@ -534,79 +543,128 @@
                 this.showProgress(true);
                 
                 try {
+                    // Create new merged PDF document
                     const mergedPdf = await PDFLib.PDFDocument.create();
                     let totalPages = 0;
+                    let successfulFiles = 0;
 
                     for (let i = 0; i < this.pdfs.length; i++) {
                         const pdf = this.pdfs[i];
-                        const progress = ((i + 1) / this.pdfs.length) * 90; // Reserve 10% for final processing
+                        const progress = ((i + 1) / this.pdfs.length) * 85; // Reserve 15% for final processing
                         this.updateProgress(progress);
 
                         try {
-                            // Create a fresh copy of the arrayBuffer for each operation
-                            const freshArrayBuffer = pdf.arrayBuffer.slice(0);
-                            const pdfDoc = await PDFLib.PDFDocument.load(freshArrayBuffer);
+                            // Create a completely fresh, independent copy of the ArrayBuffer
+                            const workingBuffer = new ArrayBuffer(pdf.originalArrayBuffer.byteLength);
+                            new Uint8Array(workingBuffer).set(new Uint8Array(pdf.originalArrayBuffer));
                             
-                            // Get all page indices
-                            const pageIndices = Array.from({ length: pdfDoc.getPageCount() }, (_, i) => i);
+                            // Load PDF document from fresh buffer
+                            const sourcePdf = await PDFLib.PDFDocument.load(workingBuffer, {
+                                ignoreEncryption: true,
+                                parseSpeed: PDFLib.ParseSpeeds.Slow,
+                                throwOnInvalidObject: false
+                            });
                             
-                            // Copy pages in smaller batches to avoid memory issues
-                            const batchSize = 10;
-                            for (let j = 0; j < pageIndices.length; j += batchSize) {
-                                const batch = pageIndices.slice(j, j + batchSize);
-                                const pages = await mergedPdf.copyPages(pdfDoc, batch);
-                                pages.forEach(page => mergedPdf.addPage(page));
+                            const pageCount = sourcePdf.getPageCount();
+                            
+                            if (pageCount === 0) {
+                                console.warn(`PDF ${pdf.name} has no pages, skipping.`);
+                                continue;
                             }
                             
-                            totalPages += pageIndices.length;
+                            // Copy pages individually for better control
+                            for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+                                try {
+                                    const [copiedPage] = await mergedPdf.copyPages(sourcePdf, [pageIndex]);
+                                    mergedPdf.addPage(copiedPage);
+                                    totalPages++;
+                                } catch (pageError) {
+                                    console.warn(`Error copying page ${pageIndex + 1} from ${pdf.name}:`, pageError);
+                                    // Continue with next page instead of failing completely
+                                }
+                            }
+                            
+                            successfulFiles++;
                             
                         } catch (pdfError) {
                             console.error(`Error processing PDF ${pdf.name}:`, pdfError);
-                            this.showStatus(`Warning: Could not process "${pdf.name}". Skipping this file.`, 'error');
-                            continue;
+                            this.showStatus(`Warning: Could not process "${pdf.name}". ${pdfError.message}`, 'error');
+                            
+                            // For protected/encrypted PDFs, try to read from original file again
+                            try {
+                                const freshFileBuffer = await pdf.file.arrayBuffer();
+                                const workingBuffer2 = new ArrayBuffer(freshFileBuffer.byteLength);
+                                new Uint8Array(workingBuffer2).set(new Uint8Array(freshFileBuffer));
+                                
+                                const sourcePdf2 = await PDFLib.PDFDocument.load(workingBuffer2, {
+                                    ignoreEncryption: false,
+                                    parseSpeed: PDFLib.ParseSpeeds.Fast
+                                });
+                                
+                                const pageCount2 = sourcePdf2.getPageCount();
+                                const [copiedPages] = await Promise.all([
+                                    mergedPdf.copyPages(sourcePdf2, Array.from({length: pageCount2}, (_, i) => i))
+                                ]);
+                                
+                                copiedPages.forEach(page => mergedPdf.addPage(page));
+                                totalPages += pageCount2;
+                                successfulFiles++;
+                                
+                            } catch (retryError) {
+                                console.error(`Retry failed for ${pdf.name}:`, retryError);
+                                continue; // Skip this file completely
+                            }
                         }
                     }
 
                     if (totalPages === 0) {
-                        throw new Error('No pages could be processed from any PDF files.');
+                        throw new Error('No pages could be processed from any PDF files. Please check if the files are corrupted or password-protected.');
                     }
 
-                    this.updateProgress(95);
+                    this.updateProgress(90);
                     
-                    // Save with error handling
+                    // Save the merged PDF with conservative settings
                     let pdfBytes;
                     try {
                         pdfBytes = await mergedPdf.save({
                             useObjectStreams: false,
                             addDefaultPage: false,
-                            objectsPerTick: 50
+                            objectsPerTick: 25,
+                            updateFieldAppearances: false
                         });
                     } catch (saveError) {
-                        console.error('Error saving PDF:', saveError);
-                        // Try alternative save method
+                        console.warn('Primary save failed, trying fallback method:', saveError);
+                        // Fallback save method
                         pdfBytes = await mergedPdf.save();
                     }
                     
                     this.updateProgress(100);
 
-                    // Download the combined PDF with custom filename
-                    const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+                    // Create and download the file
+                    const blob = new Blob([pdfBytes], { 
+                        type: 'application/pdf'
+                    });
+                    
                     const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = `${filename}.pdf`;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    URL.revokeObjectURL(url);
+                    const downloadLink = document.createElement('a');
+                    downloadLink.href = url;
+                    downloadLink.download = `${filename}.pdf`;
+                    downloadLink.style.display = 'none';
+                    
+                    document.body.appendChild(downloadLink);
+                    downloadLink.click();
+                    document.body.removeChild(downloadLink);
+                    
+                    // Clean up the URL after a short delay
+                    setTimeout(() => URL.revokeObjectURL(url), 1000);
 
                     this.showProgress(false);
-                    this.showStatus(`✅ Successfully combined ${this.pdfs.length} PDFs into "${filename}.pdf" with ${totalPages} pages!`, 'success');
+                    this.showStatus(`✅ Successfully combined ${successfulFiles}/${this.pdfs.length} PDFs into "${filename}.pdf" with ${totalPages} pages!`, 'success');
 
                 } catch (error) {
                     console.error('Error combining PDFs:', error);
                     this.showProgress(false);
-                    this.showStatus(`Error combining PDFs: ${error.message}`, 'error');
+                    this.showStatus(`Error combining PDFs: ${error.message}. Try refreshing the page and re-uploading the files.`, 'error');
                 }
             }
 
